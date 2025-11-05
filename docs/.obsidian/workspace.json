@@ -1,0 +1,188 @@
+{
+  "main": {
+    "id": "625ccafec58de280",
+    "type": "split",
+    "children": [
+      {
+        "id": "6665b60c337e7471",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "eb73a8b3c213915c",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "새 탭"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "2e2538cb6fffb7c1",
+    "type": "split",
+    "children": [
+      {
+        "id": "ef4094d2f7915a59",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "242ffd9538f53942",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "파일 탐색기"
+            }
+          },
+          {
+            "id": "31a409ac28abd4d3",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "검색"
+            }
+          },
+          {
+            "id": "d19514518bc9373d",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "북마크"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "66a04c07ab8290b2",
+    "type": "split",
+    "children": [
+      {
+        "id": "867c212ed5c3cee0",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "4e2522a0ffa8b016",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "notes/add-reddit.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "add-reddit 의 백링크"
+            }
+          },
+          {
+            "id": "ca93ea2c8696ce28",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "notes/add-reddit.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "add-reddit 의 나가는 링크"
+            }
+          },
+          {
+            "id": "3780edc4a54a2b36",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "태그"
+            }
+          },
+          {
+            "id": "c428d648ed63de8f",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "notes/add-reddit.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "add-reddit 의 개요"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:빠른 전환기 열기": false,
+      "graph:그래프 뷰 열기": false,
+      "canvas:새 캔버스 만들기": false,
+      "daily-notes:오늘의 일일 노트 열기": false,
+      "templates:템플릿 삽입": false,
+      "command-palette:명령어 팔레트 열기": false,
+      "bases:새 베이스 생성하기": false
+    }
+  },
+  "active": "242ffd9538f53942",
+  "lastOpenFiles": [
+    "무제.md",
+    "무제.canvas",
+    "무제 1.md",
+    "notes/test-file2.md",
+    "modules/test_crawl_only.md",
+    "modules/test_reddit_summary.md",
+    "modules/test_dcinside_summary.md",
+    "notes/add-summary table.md",
+    "notes/add-comment.md",
+    "notes/add-reddit.md",
+    "notes/Test-file.md",
+    "notes/use-reddit-api.md",
+    "modules/store_reddit_posts.md",
+    "modules/crawl_reddit.md",
+    "modules/store_dcinside_posts.md",
+    "overview.md",
+    "modules/codex_summary.md"
+  ]
+}

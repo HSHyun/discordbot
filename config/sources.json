@@ -1,0 +1,57 @@
+[
+  {
+    "code": "dcinside_thesingularity_recommend",
+    "name": "DCInside 특이점 추천",
+    "url_pattern": "https://gall.dcinside.com/mgallery/board/view/?id=thesingularity&no={external_id}&exception_mode=recommend&page={page}",
+    "parser": "dcinside_recommend_v1",
+    "fetch_interval_minutes": 60,
+    "metadata": {
+      "platform": "dcinside",
+      "board_id": "thesingularity",
+      "exception_mode": "recommend",
+      "target_url": "https://gall.dcinside.com/mgallery/board/lists/?id=thesingularity&exception_mode=recommend"
+    }
+  },
+  {
+    "code": "reddit_openai_new",
+    "name": "Reddit /r/OpenAI",
+    "url_pattern": "https://www.reddit.com/r/OpenAI/comments/{external_id}",
+    "parser": "reddit_new_v1",
+    "fetch_interval_minutes": 60,
+    "metadata": {
+      "platform": "reddit",
+      "subreddit": "OpenAI",
+      "target_url": "https://www.reddit.com/r/OpenAI/new/",
+      "limit": 50,
+      "asset_root": "data/reddit/openai"
+    }
+  },
+  {
+    "code": "reddit_singularity_new",
+    "name": "Reddit /r/singularity",
+    "url_pattern": "https://www.reddit.com/r/singularity/comments/{external_id}",
+    "parser": "reddit_new_v1",
+    "fetch_interval_minutes": 60,
+    "metadata": {
+      "platform": "reddit",
+      "subreddit": "singularity",
+      "target_url": "https://www.reddit.com/r/singularity/new/",
+      "limit": 50,
+      "asset_root": "data/reddit/singularity"
+    }
+  },
+  {
+    "code": "reddit_claudeai_new",
+    "name": "Reddit /r/ClaudeAI",
+    "url_pattern": "https://www.reddit.com/r/ClaudeAI/comments/{external_id}",
+    "parser": "reddit_new_v1",
+    "fetch_interval_minutes": 60,
+    "metadata": {
+      "platform": "reddit",
+      "subreddit": "ClaudeAI",
+      "target_url": "https://www.reddit.com/r/ClaudeAI/new/",
+      "limit": 50,
+      "asset_root": "data/reddit/claudeai"
+    }
+  }
+]
