@@ -1,2 +1,27 @@
+# Environment & virtualenvs
 .env
 venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local data artifacts
+data/assets/
+data/reddit/
+data/test-assets/
+
+# Config with secrets
+config/sources.json
+
+# Logs & local databases
+*.log
+*.sqlite
+*.db
+logs/
+
+# OS cruft
+.DS_Store
+Thumbs.db
