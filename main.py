@@ -246,23 +246,6 @@ def create_bot() -> commands.Bot:
             print(f"Failed to sync commands: {exc}", file=sys.stderr)
         print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    @bot.tree.command(name="latest", description="요약된 게시물 상위 5개를 보여줍니다.")
-    async def latest(interaction: discord.Interaction):
-        await interaction.response.defer(thinking=True)
-        try:
-            posts = await asyncio.to_thread(fetch_top_posts, 5)
-        except psycopg2.Error as exc:
-            print(f"Database error: {exc}", file=sys.stderr)
-            await interaction.followup.send(
-                "데이터베이스에서 정보를 불러오지 못했습니다."
-            )
-            return
-        if not posts:
-            await interaction.followup.send("요약된 게시물이 없습니다.")
-            return
-        embed = build_embed(posts)
-        await interaction.followup.send(embed=embed)
-
     return bot
 
 

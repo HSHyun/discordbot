@@ -12,6 +12,7 @@ __pycache__/
 data/assets/
 data/reddit/
 data/test-assets/
+data
 
 # Config with secrets
 config/sources.json
