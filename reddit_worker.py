@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import List
 
 import psycopg2
 
-from codex_summary import CodexConfig, SummaryError, summarise_with_codex
+from gemini_summary import GeminiConfig, SummaryError, summarise_with_gemini
 from content_fetcher import contains_video_url, download_images
 from crawl_reddit import RedditPost, fetch_reddit_post_by_url
 from db_utils import (
@@ -50,19 +51,38 @@ QUEUE_NAME = getenv_casefold("REDDIT_QUEUE") or "reddit_items"
 ASSET_ROOT = Path("data/reddit")
 ASSET_ROOT.mkdir(parents=True, exist_ok=True)
 
-CODEX_MODEL = getenv_casefold("CODEX_MODEL") or "gpt-5-codex"
-CODEX_TIMEOUT = env_int("CODEX_TIMEOUT", 180)
-MAX_TEXT_LENGTH = env_int("CODEX_MAX_TEXT", 4000)
-CODEX_DEBUG = env_flag("CODEX_DEBUG")
+DEFAULT_GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+
+def _parse_model_list(raw: str | None) -> List[str]:
+    if not raw:
+        return DEFAULT_GEMINI_MODELS.copy()
+    models = [chunk.strip() for chunk in raw.split(",")]
+    parsed = [model for model in models if model]
+    return parsed or DEFAULT_GEMINI_MODELS.copy()
+
+
+GEMINI_API_KEY = getenv_casefold("GEMINI_API_KEY") or ""
+GEMINI_MODEL_PRIORITIES = _parse_model_list(getenv_casefold("GEMINI_MODEL_PRIORITIES"))
+GEMINI_TIMEOUT = env_int("GEMINI_TIMEOUT", 180)
+MAX_TEXT_LENGTH = env_int("GEMINI_MAX_TEXT", 4000)
+GEMINI_DEBUG = env_flag("GEMINI_DEBUG")
+GEMINI_COOLDOWN = env_int("GEMINI_MODEL_COOLDOWN", 600)
 
 
 
-def _build_codex_config() -> CodexConfig:
-    return CodexConfig(
-        model=CODEX_MODEL,
-        timeout_seconds=CODEX_TIMEOUT,
+def _primary_model() -> str:
+    return GEMINI_MODEL_PRIORITIES[0] if GEMINI_MODEL_PRIORITIES else DEFAULT_GEMINI_MODELS[0]
+
+
+def _build_gemini_config() -> GeminiConfig:
+    return GeminiConfig(
+        api_key=GEMINI_API_KEY,
+        model_priorities=GEMINI_MODEL_PRIORITIES,
+        timeout_seconds=GEMINI_TIMEOUT,
         max_text_length=MAX_TEXT_LENGTH,
-        debug=CODEX_DEBUG,
+        debug=GEMINI_DEBUG,
+        cooldown_seconds=GEMINI_COOLDOWN,
     )
 
 
@@ -102,7 +122,7 @@ def process_message(body: bytes) -> MessageHandlingResult:
                 summary=None,
                 raw_text="",
                 image_count=0,
-                model_name=CODEX_MODEL,
+                model_name=_primary_model(),
                 last_error=f"Detail fetch failed: {exc}",
             )
             return MessageHandlingResult(True, f"Detail fetch failed for item {item_id}")
@@ -114,7 +134,7 @@ def process_message(body: bytes) -> MessageHandlingResult:
                 summary=None,
                 raw_text="",
                 image_count=0,
-                model_name=CODEX_MODEL,
+                model_name=_primary_model(),
                 last_error="Reddit post not found",
             )
             return MessageHandlingResult(True, f"Missing post for item {item_id}")
@@ -126,7 +146,7 @@ def process_message(body: bytes) -> MessageHandlingResult:
                 summary=None,
                 raw_text="",
                 image_count=0,
-                model_name=CODEX_MODEL,
+                model_name=_primary_model(),
                 last_error="Skipped video post",
             )
             return MessageHandlingResult(True, f"Skipped video post {item_id}")
@@ -148,14 +168,17 @@ def process_message(body: bytes) -> MessageHandlingResult:
         replace_item_assets(conn, item_id, assets)
 
         image_paths = [asset["local_path"] for asset in assets]
-        codex_config = _build_codex_config()
+        gemini_config = _build_gemini_config()
 
         last_error = None
+        model_used = _primary_model()
         try:
-            summary = summarise_with_codex(summary_input, image_paths, codex_config)
+            summary, model_used = summarise_with_gemini(summary_input, image_paths, gemini_config)
         except SummaryError as exc:
             last_error = str(exc)
-            summary = summary_input[: codex_config.max_text_length] if summary_input else None
+            fallback_limit = gemini_config.max_text_length
+            summary = summary_input[:fallback_limit] if summary_input else None
+            model_used = getattr(exc, "last_model", None) or model_used
 
         update_item_with_summary(
             conn,
@@ -163,7 +186,7 @@ def process_message(body: bytes) -> MessageHandlingResult:
             summary,
             summary_input,
             image_count=len(image_paths),
-            model_name=codex_config.model,
+            model_name=model_used,
             last_error=last_error,
         )
 

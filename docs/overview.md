@@ -4,10 +4,10 @@
 
 ## 현재 저장소 구성
 - `crawl_dcinside.py`: DCInside 추천 게시판 목록을 수집하는 크롤러.
-- `store_dcinside_posts.py`: 파이프라인 엔트리 포인트. 소스 설정을 불러와 필요한 작업을 순서대로 호출한다.
+- `store_dcinside_posts.py`: 파이프라인 엔트리 포인트. 게시물을 upsert한 뒤 RabbitMQ에 `item_id`를 발행한다.
 - `db_utils.py`: 테이블 보장, 소스 레코드 관리, 아이템 upsert/에셋 갱신 등 데이터베이스 관련 로직.
-- `content_fetcher.py`: 게시물 본문 파싱과 이미지 다운로드/확장자 추론.
-- `codex_summary.py`: Codex CLI를 호출해 요약을 생성하고 결과를 정리.
+- `content_fetcher.py`: 워커가 게시물 본문/이미지를 다시 수집할 때 사용하는 헬퍼.
+- `gemini_summary.py`: Gemini API를 호출해 요약을 생성하고 결과를 정리.
 - `main.py`: 요약된 게시물을 불러와 디스코드 봇으로 전송.
 - `data/`: 게시물 이미지 등 에셋이 저장되는 디렉터리.
 - `docs/`: 프로젝트 문서.
@@ -22,22 +22,23 @@
 
 ## 시스템 구성 요소
 - **크롤러(`crawl_dcinside.py`, `crawl_reddit.py`)**: 대상 사이트 API/HTML을 파싱해 게시물 리스트를 수집한다.
-- **파이프라인 엔트리(`store_dcinside_posts.py`, `store_reddit_posts.py`)**: 소스 설정을 확인하고 하위 모듈을 호출하며 전체 흐름을 orchestration 한다.
+- **파이프라인 엔트리(`store_dcinside_posts.py`, `store_reddit_posts.py`)**: 소스 설정을 확인하고 게시물을 upsert한 뒤 RabbitMQ에 작업을 발행한다.
 - **데이터베이스 유틸(`db_utils.py`)**: 테이블 생성/정비, 소스 레코드 관리, 게시물 upsert, 에셋 교체, 요약 결과 저장.
-- **콘텐츠 수집(`content_fetcher.py`)**: 상세 페이지 텍스트/이미지 추출, 이미지 파일 저장 및 메타데이터 생성.
-- **요약 모듈(`codex_summary.py`)**: Codex CLI와 통신해 한국어 요약을 생성.
+- **콘텐츠 수집(`content_fetcher.py`)**: 워커가 상세 페이지 텍스트/이미지를 추출하고 저장할 때 사용한다.
+- **요약 모듈(`gemini_summary.py`)**: Gemini API와 통신해 한국어 요약을 생성.
 - **Discord 봇(`main.py`)**: DB에서 요약된 콘텐츠를 읽어 임베드 형태로 디스코드 채널에 게시한다.
 - **PostgreSQL DB**: 소스 설정, 게시물, 에셋 정보를 저장한다.
-- **LLM 서비스(Codex CLI)**: 요약 및 후속 분석 작업을 담당한다.
+- **RabbitMQ**: `item_id` 작업을 큐잉해 워커가 비동기적으로 처리할 수 있도록 한다.
+- **LLM 서비스(Gemini API)**: 워커가 본문과 이미지를 요약할 때 사용한다.
 
 ## 데이터 흐름 요약
 1. 크론 잡이나 워크플로 스케줄러가 각 소스별 수집 스크립트를 실행한다.
 2. 스크립트는 `source` 테이블을 확인해 비활성 소스는 건너뛰고, 활성 소스만 크롤링한다.
-3. 신규 게시물은 `item` 테이블에 upsert되고, 상세 페이지를 통해 본문/이미지를 확보한다.
-4. Codex CLI가 텍스트/이미지를 기반으로 한국어 요약을 생성하고 `item_summary` 테이블에 저장한다.
-5. Discord 봇이 최신 요약 N개를 `item_summary`에서 읽어 임베드 메시지로 전송한다.
+3. 신규 게시물은 `item` 테이블에 upsert되고, `item_id`가 RabbitMQ 큐에 발행된다.
+4. 워커(`reddit_worker.py`, `dcinside_worker.py`)가 큐 메시지를 소비해 상세 본문/댓글/이미지를 수집하고 Gemini API로 요약을 생성한다.
+5. 요약 결과는 `item_summary` 테이블에 저장되고, Discord 봇이 최신 요약 N개를 읽어 채널에 게시한다.
 6. 향후 자동 알림 로직(예: “특정 키워드 포함”, “추천 수 급증”)으로 확장해 중요한 소식을 별도 채널로 보낼 수 있다.
-7. 비디오로 판별된 게시물은 현재 파이프라인에서 제외된다.
+7. 비디오로 판별된 게시물은 워커 단계에서 제외된다.
 
 ## 데이터베이스 구조 개요
 - `source`
@@ -60,14 +61,14 @@
   1. 크롤러 모듈 추가 (`crawl_xxx.py` 등)
   2. `store_xxx_posts.py`와 비슷한 수집 스크립트 작성
   3. `source` 레코드 등록 후 `is_active=TRUE` 설정
-- **테스트 모드 제약**: Reddit 수집은 기본적으로 최근 5시간 이내 게시물만 취득한다.
+- **테스트 모드 제약**: `REDDIT_MIN_POST_AGE_HOURS`, `DCINSIDE_MIN_POST_AGE_HOURS`, `*_MAX_POSTS` 환경 변수를 통해 수집 범위를 줄여 시험 실행을 할 수 있다.
 
 ## 향후 작업 체크리스트
 - [x] Reddit 소스 크롤러 설계 및 구현
 - [ ] 추가 소스(RSS, 뉴스레터 등) 크롤러 설계 및 구현
 - [ ] 소스별 요약 전략 개선 (핵심 문구 추출, 태그 분류 등)
 - [ ] Discord 알림 로직 고도화 (중요도 필터, 알림 주기 조정)
-- [ ] 문서 기반 워크플로 확립 (ADR 작성, 다이어그램 추가, Codex와 연동된 자동 요약 스크립트)
+- [ ] 문서 기반 워크플로 확립 (ADR 작성, 다이어그램 추가, Gemini와 연동된 자동 요약 스크립트)
 - [ ] 배포/스케줄링 환경 구축 (예: cron, GitHub Actions, Airflow 등)
 
-이 문서를 Obsidian Vault나 버전 관리(Git)와 연결해 지속적으로 업데이트하면, 문서 기반으로 기능을 설계하고 Codex에게 구현 골격을 맡기는 워크플로를 안정적으로 운영할 수 있다.
+이 문서를 Obsidian Vault나 버전 관리(Git)와 연결해 지속적으로 업데이트하면, 문서 기반으로 기능을 설계하고 Gemini에게 구현 골격을 맡기는 워크플로를 안정적으로 운영할 수 있다.

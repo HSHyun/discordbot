@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-"""Reddit 서브레딧 게시물을 수집해 DB에 저장하고 Codex로 요약합니다."""
+"""Reddit 서브레딧 게시물을 upsert하고 RabbitMQ에 작업을 발행합니다."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
 
+import pika
 import psycopg2
 
 from crawl_reddit import DEFAULT_USER_AGENT, RedditPost, fetch_reddit_posts
-from codex_summary import CodexConfig, SummaryError, summarise_with_codex
-from content_fetcher import contains_video_url, download_images
+from content_fetcher import contains_video_url
 from db_utils import (
     SourceConfig,
     ensure_tables,
     get_or_create_source,
-    replace_item_assets,
-    replace_item_comments,
     seed_sources_from_file,
     upsert_items,
-    update_item_with_summary,
 )
 
 SUBREDDITS = ["OpenAI", "singularity", "ClaudeAI"]
@@ -30,35 +28,28 @@ REDDIT_HEADERS = {
     "Accept": "application/json",
 }
 
-REDDIT_ASSET_ROOT = Path("data/reddit")
-REDDIT_ASSET_ROOT.mkdir(parents=True, exist_ok=True)
-
 
 def load_env_file(path: Path = Path(".env")) -> None:
-    """.env 파일의 키와 값을 읽어 환경 변수로 설정합니다."""
     if not path.exists():
         return
-
     try:
         with path.open("r", encoding="utf-8") as env_file:
             for raw_line in env_file:
                 line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, value = line.partition("=")
                 key = key.strip()
                 if not key or key in os.environ:
                     continue
-                cleaned_value = value.strip()
+                cleaned = value.strip()
                 if (
-                    len(cleaned_value) >= 2
-                    and cleaned_value[0] == cleaned_value[-1]
-                    and cleaned_value[0] in {'"', "'"}
+                    len(cleaned) >= 2
+                    and cleaned[0] == cleaned[-1]
+                    and cleaned[0] in {'"', "'"}
                 ):
-                    cleaned_value = cleaned_value[1:-1]
-                os.environ[key] = cleaned_value
+                    cleaned = cleaned[1:-1]
+                os.environ[key] = cleaned
     except OSError:
         pass
 
@@ -67,7 +58,6 @@ load_env_file()
 
 
 def getenv_casefold(key: str) -> str | None:
-    """환경 변수 키의 대소문자와 상관없이 값을 반환합니다."""
     target = key.casefold()
     for env_key, value in os.environ.items():
         if env_key.casefold() == target:
@@ -75,16 +65,7 @@ def getenv_casefold(key: str) -> str | None:
     return None
 
 
-def env_flag(key: str, default: bool = False) -> bool:
-    """대소문자를 구분하지 않고 환경 변수 값을 불리언으로 해석합니다."""
-    value = getenv_casefold(key)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"", "0", "false", "off", "no"}
-
-
 def env_int(key: str, default: int) -> int:
-    """정수형 환경 변수 값을 읽고 실패하면 기본값을 반환합니다."""
     value = getenv_casefold(key)
     if value is None:
         return default
@@ -102,10 +83,9 @@ DB_CONFIG = {
     "port": env_int("DB_PORT", 5432),
 }
 
-CODEX_DEBUG = env_flag("CODEX_DEBUG")
-CODEX_MODEL = getenv_casefold("CODEX_MODEL") or "gpt-5-codex"
-CODEX_TIMEOUT_SECONDS = env_int("CODEX_TIMEOUT", 180)
-MAX_TEXT_FOR_SUMMARY = env_int("CODEX_MAX_TEXT", 4000)
+MAX_POSTS_PER_SUBREDDIT = env_int("REDDIT_MAX_POSTS", 0)
+MIN_POST_AGE_HOURS = env_int("REDDIT_MIN_POST_AGE_HOURS", 0)
+REDDIT_QUEUE = getenv_casefold("REDDIT_QUEUE") or "reddit_items"
 
 
 def build_source_config(subreddit: str) -> SourceConfig:
@@ -127,23 +107,44 @@ def build_source_config(subreddit: str) -> SourceConfig:
     )
 
 
-def compose_post_text(post: RedditPost, comment_lines: List[str] | None = None) -> str:
-    lines: List[str] = [post.title]
-    if post.selftext.strip():
-        lines.append(post.selftext.strip())
-    else:
-        lines.append("(텍스트 본문 없음 — 링크/미디어 게시물입니다.)")
-    meta_line = (
-        f"작성자: u/{post.author} | 업보트: {post.score} | 댓글: {post.num_comments}"
+def _publish_item_ids(queue_name: str, item_ids: List[int]) -> None:
+    if not queue_name or not item_ids:
+        return
+    url = getenv_casefold("RABBITMQ_URL") or "amqp://guest:guest@localhost:5672/%2F"
+    params = pika.URLParameters(url)
+    connection: pika.BlockingConnection | None = None
+    channel: pika.channel.Channel | None = None
+    try:
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        channel.queue_declare(queue=queue_name, durable=True)
+        for item_id in item_ids:
+            payload = json.dumps({"item_id": item_id}).encode("utf-8")
+            channel.basic_publish(exchange="", routing_key=queue_name, body=payload)
+    finally:
+        if channel and channel.is_open:
+            channel.close()
+        if connection and connection.is_open:
+            connection.close()
+
+
+def fetch_posts_for_subreddit(subreddit: str) -> List[RedditPost]:
+    limit = MAX_POSTS_PER_SUBREDDIT if MAX_POSTS_PER_SUBREDDIT > 0 else 50
+    return fetch_reddit_posts(
+        subreddit,
+        limit=limit,
+        user_agent=DEFAULT_USER_AGENT,
+        max_age_hours=MIN_POST_AGE_HOURS if MIN_POST_AGE_HOURS > 0 else None,
     )
-    lines.append(meta_line)
-    if post.url:
-        lines.append(f"원문: {post.url}")
-    if comment_lines:
-        lines.append(
-            "\n".join(["댓글 전체 목록 (원댓글/대댓글 구조):"] + comment_lines)
-        )
-    return "\n\n".join(lines)
+
+
+def _filter_posts(posts: List[RedditPost]) -> List[RedditPost]:
+    filtered = []
+    for post in posts:
+        if post.is_video or contains_video_url(post.media_urls):
+            continue
+        filtered.append(post)
+    return filtered
 
 
 def _normalise_reddit_comments(raw_comments: List[dict]) -> List[dict]:
@@ -190,7 +191,6 @@ def _normalise_reddit_comments(raw_comments: List[dict]) -> List[dict]:
 
 
 def _comments_for_summary(comments: List[dict]) -> List[str]:
-    """댓글과 대댓글 관계를 유지한 설명용 문자열을 생성합니다."""
     if not comments:
         return []
 
@@ -224,10 +224,7 @@ def _comments_for_summary(comments: List[dict]) -> List[str]:
         if depth_level <= 0:
             label = "[원댓글]"
         else:
-            if parent_author:
-                label = f"[대댓글 → {parent_author}]"
-            else:
-                label = "[대댓글]"
+            label = f"[대댓글 → {parent_author}]" if parent_author else "[대댓글]"
 
         line = f"{indent}{label} {author}{score_text}: {content}"
         display_lines.append(line)
@@ -235,77 +232,30 @@ def _comments_for_summary(comments: List[dict]) -> List[str]:
     return display_lines
 
 
-def process_jobs(
-    conn,
-    jobs,
-    subreddit: str,
-    codex_config: CodexConfig,
-) -> None:
-    asset_root = REDDIT_ASSET_ROOT / subreddit.lower()
-    asset_root.mkdir(parents=True, exist_ok=True)
-
-    for post, item_id, _inserted in jobs:
-        assert isinstance(post, RedditPost)
-        raw_comments: List[dict] = []
-        if isinstance(post.metadata, dict):
-            raw_comments = post.metadata.get("comments") or []
-        normalised_comments = _normalise_reddit_comments(raw_comments)
-        replace_item_comments(conn, item_id, normalised_comments)
-
-        comment_lines = _comments_for_summary(normalised_comments)
-        raw_text = compose_post_text(post, comment_lines)
-        image_urls = post.media_urls
-        assets = download_images(
-            image_urls=image_urls,
-            external_id=post.external_id,
-            referer=post.url,
-            asset_root=asset_root,
-            headers=REDDIT_HEADERS,
-        )
-        replace_item_assets(conn, item_id, assets)
-
-        image_paths = [asset["local_path"] for asset in assets]
-        last_error = None
-        summary = None
-        try:
-            summary = summarise_with_codex(raw_text, image_paths, codex_config)
-        except SummaryError as exc:
-            last_error = str(exc)
-            summary = raw_text[: codex_config.max_text_length] if raw_text else None
-
-        if summary:
-            update_item_with_summary(
-                conn,
-                item_id,
-                summary,
-                raw_text,
-                image_count=len(image_paths),
-                model_name=codex_config.model,
-                last_error=last_error,
-            )
-
-
-def fetch_posts_for_subreddit(subreddit: str) -> List[RedditPost]:
-    limit = 50
-    return fetch_reddit_posts(
-        subreddit,
-        limit=limit,
-        user_agent=DEFAULT_USER_AGENT,
+def compose_post_text(post: RedditPost, comment_lines: List[str] | None = None) -> str:
+    lines: List[str] = [post.title]
+    if post.selftext.strip():
+        lines.append(post.selftext.strip())
+    else:
+        lines.append("(텍스트 본문 없음 — 링크/미디어 게시물입니다.)")
+    meta_line = (
+        f"작성자: u/{post.author} | 업보트: {post.score} | 댓글: {post.num_comments}"
     )
+    lines.append(meta_line)
+    if post.url:
+        lines.append(f"원문: {post.url}")
+    if comment_lines:
+        lines.append(
+            "\n".join(["댓글 전체 목록 (원댓글/대댓글 구조):"] + comment_lines)
+        )
+    return "\n\n".join(lines)
 
 
 def main() -> None:
-    codex_config = CodexConfig(
-        model=CODEX_MODEL,
-        timeout_seconds=CODEX_TIMEOUT_SECONDS,
-        max_text_length=MAX_TEXT_FOR_SUMMARY,
-        debug=CODEX_DEBUG,
-    )
-
     with psycopg2.connect(**DB_CONFIG) as conn:
         ensure_tables(conn)
         seed_sources_from_file(conn, Path("config/sources.json"))
-        total_jobs = 0
+        total_queued = 0
         for subreddit in SUBREDDITS:
             posts = fetch_posts_for_subreddit(subreddit)
             if not posts:
@@ -321,29 +271,21 @@ def main() -> None:
                 )
 
             if not source.get("is_active"):
-                print(
-                    f"Source '{source.get('code')}' inactive; skipping r/{subreddit}."
-                )
+                print(f"Source '{source.get('code')}' inactive; skipping r/{subreddit}.")
                 continue
 
-            filtered_posts = [
-                post
-                for post in posts
-                if not post.is_video and not contains_video_url(post.media_urls)
-            ]
+            filtered_posts = _filter_posts(posts)
             if not filtered_posts:
-                print(f"No eligible posts (non-video) for r/{subreddit}; skipping.")
+                print(f"No eligible posts for r/{subreddit}; skipping.")
                 continue
 
             jobs = upsert_items(conn, source["id"], filtered_posts)
-            if not jobs:
-                print(f"No upserted items for r/{subreddit}.")
-                continue
+            inserted_ids = [item_id for _post, item_id, inserted in jobs if inserted]
+            _publish_item_ids(REDDIT_QUEUE, inserted_ids)
+            total_queued += len(inserted_ids)
+            print(f"Queued {len(inserted_ids)} posts for r/{subreddit}.")
 
-            process_jobs(conn, jobs, subreddit, codex_config)
-            total_jobs += len(jobs)
-
-    print(f"Processed {total_jobs} Reddit posts (details & summaries).")
+    print(f"Queued {total_queued} Reddit posts (details will be processed by workers).")
 
 
 if __name__ == "__main__":

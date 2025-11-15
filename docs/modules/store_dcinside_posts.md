@@ -1,30 +1,29 @@
 # store_dcinside_posts.py 요약
 
 ## 역할
-- `.env`를 통해 환경 값을 불러오고 소스별 기본 설정을 정의한다.
-- `db_utils`, `content_fetcher`, `codex_summary` 모듈을 orchestration 해 전체 파이프라인을 수행한다.
-- 허용된 말머리만 필터링한 뒤 DB 상태와 소스 활성 여부를 점검하고 작업을 실행한다.
+- `.env`를 읽어 DB 접속 정보, 게시물 제한(`DCINSIDE_MAX_POSTS`), 최소 경과 시간(`DCINSIDE_MIN_POST_AGE_HOURS`), RabbitMQ 큐 이름(`DCINSIDE_QUEUE`) 등을 초기화한다.
+- DCInside 추천 게시판 목록을 크롤링해 허용된 말머리/시간 조건을 통과한 게시물만 선별한다.
+- `upsert_items()`로 `item` 테이블을 갱신한 뒤, 새로 삽입된 `item_id`를 RabbitMQ 큐에 발행해 후속 워커가 상세 수집·요약을 수행하도록 트리거한다.
 
-- **환경 변수 로더**: `.env` 파일을 읽어 DB 접속 정보와 Codex 설정을 초기화.
-- **소스 설정 상수**: `SourceConfig` 인스턴스로 코드/이름/패턴/메타데이터를 정의.
-- **`process_details`**: 콘텐츠·댓글 수집, 에셋 저장, Codex 요약 호출을 담당 모듈과 협업해 수행하며 비디오 링크가 발견되면 해당 아이템을 삭제하고 건너뜀. 생성된 요약은 `item_summary`에 저장한다.
-- 실행 초기에 `seed_sources_from_file()`로 기본 소스 구성을 등록하고, 필요 시 관리자 승인을 통해 활성화한다.
-- **`main`**: 크롤링 대상 필터링, 테이블 보장, 소스 활성 확인 후 세부 작업 호출.
+## 주요 동작
+1. `fetch_posts()` 결과에서 허용된 말머리만 남기고, `DCINSIDE_MIN_POST_AGE_HOURS`가 설정돼 있으면 해당 시간 이상 지난 게시물만 유지한다.
+2. `DCINSIDE_MAX_POSTS`가 양수라면 테스트 편의를 위해 그 수만큼만 잘라서 처리한다.
+3. DB 테이블을 보장(`ensure_tables`)하고 소스 구성을 조회/생성(`get_or_create_source`), 비활성 소스는 건너뛴다.
+4. `upsert_items()`로 게시물을 저장하고, `inserted=True`였던 `item_id` 목록을 `DCINSIDE_QUEUE` 큐에 JSON 메시지(`{"item_id": ...}`)로 발행한다.
+5. 실제 본문·이미지·댓글 수집과 Gemini 요약은 `dcinside_worker.py`가 큐를 소비하면서 수행한다.
 
 ## 외부 의존성
 - `psycopg2-binary`: PostgreSQL 연결.
-- `requests`: 상세 페이지 요청 시 예외 처리용 타입 사용.
-- `Codex CLI`: 요약 생성(외부 명령 실행 필요).
-- 내부 모듈 `db_utils`, `content_fetcher`, `codex_summary`.
+- `pika`: RabbitMQ 퍼블리싱.
+- 내부 모듈 `crawl_dcinside`, `db_utils`.
 
 ## 운영 시 유의 사항
-- `source.is_active`가 `TRUE`인 경우에만 크롤링과 요약이 진행된다.
-- 이미지 다운로드 경로는 `data/assets/{external_id}`로 고정되어 있으므로 저장 공간을 주기적으로 관리해야 한다.
-- 모바일 페이지에서 댓글을 함께 수집하므로 구조 변경 시 파서 업데이트가 필요하다.
-- Codex 요약 실패 시 원문 텍스트 일부만 저장되며, 오류 메시지는 `metadata.summary_error`에 기록된다.
-- 비디오 URL이 포함된 게시물은 요약과 저장을 생략하고 `item` 레코드를 삭제한다.
+- `source.is_active`가 `TRUE`인 경우에만 큐 발행이 이루어진다.
+- `RABBITMQ_URL`과 `DCINSIDE_QUEUE`를 `.env`에 정의해야 큐로 메시지를 보낼 수 있으며, 스크립트 실행 시 해당 큐가 없으면 자동으로 선언된다.
+- `DCINSIDE_MIN_POST_AGE_HOURS`를 활용하면 일정 시간 후에만 게시물을 워커에 넘겨, 초기 댓글 누락을 줄일 수 있다.
+- 테스트할 때는 `DCINSIDE_MAX_POSTS`로 크롤링 건수를 제어할 수 있다.
 
 ## 확장 아이디어
-- SourceConfig를 외부 YAML/JSON에서 불러오도록 확장해 멀티 소스 대응.
-- `process_details`를 비동기 실행(쓰레드/async)으로 전환해 처리 속도 개선.
-- CodexConfig를 소스 메타데이터에 포함시켜 소스별 다른 프롬프트를 허용.
+- 다중 갤러리를 지원하도록 `SUBJECT` 필터/소스 구성을 외부 설정으로 분리.
+- 게시물 필터링 기준(예: 추천 수, 댓글 수)을 환경 변수로 추가해 상황에 맞게 조정.
+- 발행 실패 시를 대비해 DLQ(Dead Letter Queue)나 재시도 로직을 도입.

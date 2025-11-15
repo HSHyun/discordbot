@@ -1,56 +1,49 @@
 #!/usr/bin/env python3
-"""DCInside 게시물을 가져와 저장하고 Codex CLI로 요약합니다."""
+"""DCInside 게시물을 upsert하고 RabbitMQ 작업을 발행한다."""
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
+import pika
 import psycopg2
-import requests
 
-from crawl_dcinside import HEADERS, Post, TARGET_URL, fetch_posts
-from codex_summary import CodexConfig, SummaryError, summarise_with_codex
-from content_fetcher import contains_video_url, download_images, fetch_post_body
+from crawl_dcinside import Post, TARGET_URL, fetch_posts
 from db_utils import (
     SourceConfig,
     ensure_tables,
     get_or_create_source,
-    replace_item_assets,
-    replace_item_comments,
-    delete_item,
     seed_sources_from_file,
     upsert_items,
-    update_item_with_summary,
 )
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
-    """.env 파일의 키와 값을 읽어 환경 변수로 설정합니다."""
+    """.env 파일을 읽어 환경 변수에 주입한다."""
     if not path.exists():
         return
-
     try:
         with path.open("r", encoding="utf-8") as env_file:
             for raw_line in env_file:
                 line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, _, value = line.partition("=")
                 key = key.strip()
                 if not key or key in os.environ:
                     continue
-                cleaned_value = value.strip()
+                cleaned = value.strip()
                 if (
-                    len(cleaned_value) >= 2
-                    and cleaned_value[0] == cleaned_value[-1]
-                    and cleaned_value[0] in {'"', "'"}
+                    len(cleaned) >= 2
+                    and cleaned[0] == cleaned[-1]
+                    and cleaned[0] in {'"', "'"}
                 ):
-                    cleaned_value = cleaned_value[1:-1]
-                os.environ[key] = cleaned_value
+                    cleaned = cleaned[1:-1]
+                os.environ[key] = cleaned
     except OSError:
         pass
 
@@ -59,7 +52,6 @@ load_env_file()
 
 
 def getenv_casefold(key: str) -> str | None:
-    """환경 변수 키의 대소문자와 상관없이 값을 반환합니다."""
     target = key.casefold()
     for env_key, value in os.environ.items():
         if env_key.casefold() == target:
@@ -67,16 +59,7 @@ def getenv_casefold(key: str) -> str | None:
     return None
 
 
-def env_flag(key: str, default: bool = False) -> bool:
-    """대소문자를 구분하지 않고 환경 변수 값을 불리언으로 해석합니다."""
-    value = getenv_casefold(key)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"", "0", "false", "off", "no"}
-
-
 def env_int(key: str, default: int) -> int:
-    """정수형 환경 변수 값을 읽고 실패하면 기본값을 반환합니다."""
     value = getenv_casefold(key)
     if value is None:
         return default
@@ -122,141 +105,62 @@ ALLOWED_SUBJECTS = {
     "대회",
 }
 
-ASSET_ROOT = Path("data/assets")
-ASSET_ROOT.mkdir(parents=True, exist_ok=True)
-
-CODEX_DEBUG = env_flag("CODEX_DEBUG")
-CODEX_MODEL = getenv_casefold("CODEX_MODEL") or "gpt-5-codex"
-CODEX_TIMEOUT_SECONDS = env_int("CODEX_TIMEOUT", 300)
-MAX_TEXT_FOR_SUMMARY = 4000
+MAX_FETCH_POSTS = env_int("DCINSIDE_MAX_POSTS", 0)
+MIN_POST_AGE_HOURS = env_int("DCINSIDE_MIN_POST_AGE_HOURS", 0)
+DCINSIDE_QUEUE = getenv_casefold("DCINSIDE_QUEUE") or "dcinside_items"
 
 
-def _comment_lines_for_summary(comments: List[dict]) -> List[str]:
-    """댓글 전체를 구조 정보와 함께 요약 입력에 포함할 수 있도록 문자열로 만든다."""
-    if not comments:
-        return []
-
-    id_to_author = {
-        str(comment.get("external_id")): (comment.get("author") or "unknown")
-        for comment in comments
-        if comment.get("external_id") is not None
-    }
-
-    lines: List[str] = []
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-        author = comment.get("author") or "unknown"
-        content = (comment.get("content") or "").strip()
-        if not content:
-            continue
-
-        metadata = comment.get("metadata") or {}
-        depth = metadata.get("depth")
-        try:
-            depth_level = int(depth) if depth is not None else 0
-        except (TypeError, ValueError):
-            depth_level = 0
-
-        parent_external = comment.get("parent_external_id")
-        parent_author = None
-        if parent_external is not None:
-            parent_author = id_to_author.get(str(parent_external))
-
-        indent = "  " * max(depth_level, 0)
-        if depth_level <= 0:
-            label = "[원댓글]"
-        else:
-            label = f"[대댓글 → {parent_author}]" if parent_author else "[대댓글]"
-
-        line = f"{indent}{label} {author}: {content}"
-        lines.append(line)
-
-    return lines
+def _parse_post_datetime(post: Post) -> datetime | None:
+    if not post.date_iso:
+        return None
+    try:
+        parsed = datetime.strptime(post.date_iso, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc)
 
 
-def process_details(
-    conn,
-    jobs,
-    codex_config: CodexConfig,
-    asset_root: Path = ASSET_ROOT,
-) -> None:
-    """상세 페이지를 수집하고 에셋을 관리하며 콘텐츠를 요약합니다."""
-    for post, item_id, _inserted in jobs:
-        try:
-            body_text, image_urls, comments = fetch_post_body(post.url, HEADERS)
-        except requests.RequestException as exc:
-            body_text, image_urls, comments = "", [], []
-            last_error = f"Detail fetch failed: {exc}"
-            update_item_with_summary(
-                conn,
-                item_id,
-                summary=None,
-                raw_text=body_text,
-                image_count=0,
-                model_name=codex_config.model,
-                last_error=last_error,
-            )
-            continue
+def _publish_item_ids(queue_name: str, item_ids: List[int]) -> None:
+    if not queue_name or not item_ids:
+        return
+    url = getenv_casefold("RABBITMQ_URL") or "amqp://guest:guest@localhost:5672/%2F"
+    params = pika.URLParameters(url)
+    connection: pika.BlockingConnection | None = None
+    channel: pika.channel.Channel | None = None
+    try:
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        channel.queue_declare(queue=queue_name, durable=True)
+        for item_id in item_ids:
+            payload = json.dumps({"item_id": item_id}).encode("utf-8")
+            channel.basic_publish(exchange="", routing_key=queue_name, body=payload)
+    finally:
+        if channel and channel.is_open:
+            channel.close()
+        if connection and connection.is_open:
+            connection.close()
 
-        if contains_video_url(image_urls):
-            print(f"Skipping video post {post.url}; deleting item {item_id}.")
-            delete_item(conn, item_id)
-            continue
 
-        replace_item_comments(conn, item_id, comments)
-        summary_input = body_text
-        comment_lines = _comment_lines_for_summary(comments)
-        if comment_lines:
-            summary_input = (
-                summary_input
-                + "\n\n댓글 전체 목록 (원댓글/대댓글 구조):\n"
-                + "\n".join(comment_lines)
-            )
-
-        assets = download_images(
-            image_urls=image_urls,
-            external_id=post.external_id or str(item_id),
-            referer=post.url,
-            asset_root=asset_root,
-            headers=HEADERS,
-        )
-        replace_item_assets(conn, item_id, assets)
-
-        image_paths = [asset["local_path"] for asset in assets]
-        last_error = None
-        summary = None
-        try:
-            summary = summarise_with_codex(summary_input, image_paths, codex_config)
-        except SummaryError as exc:
-            last_error = str(exc)
-            summary = (
-                summary_input[: codex_config.max_text_length] if summary_input else None
-            )
-
-        update_item_with_summary(
-            conn,
-            item_id,
-            summary,
-            body_text,
-            image_count=len(image_paths),
-            model_name=codex_config.model,
-            last_error=last_error,
-        )
+def _filter_posts(posts: List[Post]) -> List[Post]:
+    filtered = [post for post in posts if post.subject in ALLOWED_SUBJECTS]
+    if MIN_POST_AGE_HOURS > 0:
+        threshold = datetime.now(timezone.utc) - timedelta(hours=MIN_POST_AGE_HOURS)
+        aged: List[Post] = []
+        for post in filtered:
+            published_at = _parse_post_datetime(post)
+            if published_at and published_at <= threshold:
+                aged.append(post)
+        filtered = aged
+    if MAX_FETCH_POSTS > 0:
+        filtered = filtered[:MAX_FETCH_POSTS]
+    return filtered
 
 
 def main() -> None:
-    posts = [post for post in fetch_posts() if post.subject in ALLOWED_SUBJECTS]
+    posts = _filter_posts(list(fetch_posts()))
     if not posts:
-        print("No posts matched allowed subjects; aborting.")
+        print("No posts matched filters; aborting.")
         return
-
-    codex_config = CodexConfig(
-        model=CODEX_MODEL,
-        timeout_seconds=CODEX_TIMEOUT_SECONDS,
-        max_text_length=MAX_TEXT_FOR_SUMMARY,
-        debug=CODEX_DEBUG,
-    )
 
     with psycopg2.connect(**DB_CONFIG) as conn:
         ensure_tables(conn)
@@ -267,15 +171,15 @@ def main() -> None:
                 "Created source configuration with is_active=FALSE. "
                 "Update the record to enable crawling."
             )
-
         if not source.get("is_active"):
             print(f"Source '{source.get('code')}' is inactive; skipping crawl.")
             return
 
         jobs = upsert_items(conn, source["id"], posts)
-        process_details(conn, jobs, codex_config)
 
-    print(f"Processed {len(jobs)} posts (details fetched & summarised).")
+    inserted_ids = [item_id for _post, item_id, inserted in jobs if inserted]
+    _publish_item_ids(DCINSIDE_QUEUE, inserted_ids)
+    print(f"Queued {len(inserted_ids)} DCInside posts for processing.")
 
 
 if __name__ == "__main__":

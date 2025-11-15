@@ -92,37 +92,30 @@ class RabbitMQClient:
         url = getenv_casefold("RABBITMQ_URL") or "amqp://guest:guest@localhost:5672/%2F"
         self.parameters = pika.URLParameters(url)
 
-    def consume_one(
+    def consume_forever(
         self, handler: Callable[[bytes], MessageHandlingResult]
-    ) -> MessageHandlingResult:
+    ) -> None:
         connection: pika.BlockingConnection | None = None
         channel: pika.channel.Channel | None = None
         try:
             connection = pika.BlockingConnection(self.parameters)
             channel = connection.channel()
             channel.basic_qos(prefetch_count=1)
-            method_frame, _header_frame, body = channel.basic_get(
-                queue=self.queue_name, auto_ack=False
-            )
-            if method_frame is None:
-                return MessageHandlingResult(False, "queue empty")
 
-            try:
-                result = handler(body)
-            except MessageHandlingError as exc:
-                logger.error("Message handling failed: %s", exc, exc_info=True)
-                if channel.is_open:
-                    channel.basic_nack(method_frame.delivery_tag, requeue=exc.requeue)
-                raise
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Unhandled exception during message processing")
-                if channel.is_open:
-                    channel.basic_nack(method_frame.delivery_tag, requeue=True)
-                raise MessageHandlingError(str(exc), requeue=True) from exc
-            else:
-                if channel.is_open:
-                    channel.basic_ack(method_frame.delivery_tag)
-                return result
+            def _callback(ch, method, _properties, body):
+                try:
+                    handler(body)
+                except MessageHandlingError as exc:
+                    logger.error("Message handling failed: %s", exc, exc_info=True)
+                    ch.basic_nack(method.delivery_tag, requeue=exc.requeue)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Unhandled exception during message processing")
+                    ch.basic_nack(method.delivery_tag, requeue=True)
+                else:
+                    ch.basic_ack(method.delivery_tag)
+
+            channel.basic_consume(queue=self.queue_name, on_message_callback=_callback)
+            channel.start_consuming()
         finally:
             try:
                 if channel and channel.is_open:
@@ -132,77 +125,25 @@ class RabbitMQClient:
                     connection.close()
 
 
-def _build_handler(
-    client: RabbitMQClient, message_handler: Callable[[bytes], MessageHandlingResult]
-) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802
-            content_length = int(self.headers.get("Content-Length", "0") or "0")
-            if content_length:
-                _ = self.rfile.read(content_length)
-            try:
-                result = client.consume_one(message_handler)
-            except MessageHandlingError as exc:
-                status = (
-                    HTTPStatus.INTERNAL_SERVER_ERROR
-                    if exc.requeue
-                    else HTTPStatus.BAD_REQUEST
-                )
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
-                self.wfile.write(payload)
-                return
-            except Exception as exc:  # noqa: BLE001
-                self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                payload = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
-                self.wfile.write(payload)
-                return
-
-            if not result.processed:
-                self.send_response(HTTPStatus.NO_CONTENT)
-                self.end_headers()
-                return
-
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            payload = json.dumps({"ok": True, "message": result.message}).encode(
-                "utf-8"
-            )
-            self.wfile.write(payload)
-
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A003, D401
-            logger.info("%s - %s", self.address_string(), format % args)
-
-    return Handler
-
-
 def serve(
     worker_name: str,
     client: RabbitMQClient,
     message_handler: Callable[[bytes], MessageHandlingResult],
 ) -> None:
-    port = env_int("PORT", 8080)
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [%(levelname)s] {worker_name}: %(message)s",
     )
-    handler = _build_handler(client, message_handler)
-    server = ThreadingHTTPServer(("0.0.0.0", port), handler)
-    logger.info("Starting %s worker on port %s", worker_name, port)
+    logger.info("Starting %s worker (long running)", worker_name)
 
     def _handle_signal(_signum: int, _frame: Optional[FrameType]) -> None:
-        logger.info("Received shutdown signal. Stopping server...")
-        server.shutdown()
+        logger.info("Received shutdown signal. Exiting...")
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     try:
-        server.serve_forever()
-    finally:
-        server.server_close()
+        client.consume_forever(message_handler)
+    except KeyboardInterrupt:
+        logger.info("Worker stopped.")

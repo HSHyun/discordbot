@@ -514,7 +514,7 @@ def fetch_reddit_posts(
 
     for child in payload.get("data", {}).get("children", []):
         node = child.get("data") or {}
-        if cutoff is not None and (node.get("created_utc") or 0) < cutoff:
+        if cutoff is not None and (node.get("created_utc") or 0) > cutoff:
             continue
         created = _to_datetime(node.get("created_utc"))
         post = _build_reddit_post(
