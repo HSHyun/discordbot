@@ -10,7 +10,7 @@ from typing import Iterable, List
 
 from psycopg2.extras import Json, RealDictCursor
 
-from crawl_dcinside import Post
+from ..crawl.crawl_dcinside import Post
 
 
 @dataclass(frozen=True)
@@ -550,4 +550,3 @@ def update_item_with_summary(
                 ),
             )
     conn.commit()
-

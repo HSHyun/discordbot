@@ -12,14 +12,13 @@ from typing import List
 import pika
 import psycopg2
 
-from crawl_dcinside import Post, TARGET_URL, fetch_posts
-from db_utils import (
-    SourceConfig,
-    ensure_tables,
-    get_or_create_source,
-    seed_sources_from_file,
-    upsert_items,
-)
+if __package__ is None or __package__ == "":
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from discordbot.crawl.crawl_dcinside import Post, TARGET_URL, fetch_posts
+from discordbot.services.db import SourceConfig, ensure_tables, get_or_create_source, seed_sources_from_file, upsert_items
 
 
 def load_env_file(path: Path = Path(".env")) -> None:

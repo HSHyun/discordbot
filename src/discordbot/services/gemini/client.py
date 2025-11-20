@@ -1,55 +1,20 @@
-"""Gemini API를 이용해 게시물을 요약한다."""
-
 from __future__ import annotations
 
 import base64
 import json
 import mimetypes
 import sys
-import time
-from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import requests
 
-
-class SummaryError(Exception):
-    """Gemini 요약 처리 실패."""
-
-    def __init__(self, message: str, *, last_model: str | None = None) -> None:
-        super().__init__(message)
-        self.last_model = last_model
-
-
-@dataclass(frozen=True)
-class GeminiConfig:
-    """Gemini 호출에 필요한 설정."""
-
-    api_key: str
-    model_priorities: Sequence[str]
-    timeout_seconds: int
-    max_text_length: int
-    debug: bool = False
-    api_endpoint: str = "https://generativelanguage.googleapis.com"
-    cooldown_seconds: int = 600
-    image_limit: int = 8
-    generation_config: Dict[str, object] = field(
-        default_factory=lambda: {
-            "temperature": 0.4,
-            "topP": 0.95,
-            "topK": 40,
-            "maxOutputTokens": 8192,  # 기본 출력 토큰을 512에서 8192로 대폭 상향
-        }
-    )
-
-
-# 모델별 쿨다운 만료 시간을 저장한다.
-_MODEL_COOLDOWNS: Dict[str, float] = {}
-
-
-class _ModelQuotaError(SummaryError):
-    """모델 사용량 한도 초과 또는 일시적인 제한을 나타낸다."""
-
+from .config import (
+    GeminiConfig,
+    SummaryError,
+    clear_cooldown,
+    cooldown_until,
+    set_cooldown,
+)
 
 SYSTEM_PROMPT = (
     "당신은 DCInside나 Reddit 게시물을 한국어로 요약하는 전문가입니다. 출력은 반드시 자연스럽고"
@@ -58,6 +23,10 @@ SYSTEM_PROMPT = (
     " 맥락에 자연스럽게 녹여 설명합니다. 고유명사는 원문 표기를 유지하세요."
     " 정량적 표현:  '많다', '높다', '대폭' 같은 모호한 표현 대신, **'88% 증가', '300만 토큰', '1위'** 처럼 구체적인 수치나 퍼센티지를 명확히 명시하세요."
 )
+
+
+class _ModelQuotaError(SummaryError):
+    """모델 사용량 한도 초과 또는 일시적인 제한을 나타낸다."""
 
 
 def summarise_with_gemini(
@@ -92,11 +61,10 @@ def summarise_with_gemini(
     image_parts = list(_build_image_parts(image_paths, config.image_limit))
 
     errors: List[str] = []
-    now = time.time()
     last_attempted_model: str | None = None
     for model in available_models:
-        cooldown_until = _MODEL_COOLDOWNS.get(model)
-        if cooldown_until and cooldown_until > now:
+        cooldown_ts = cooldown_until(model)
+        if cooldown_ts > 0 and cooldown_ts > _now():
             continue
 
         try:
@@ -111,7 +79,7 @@ def summarise_with_gemini(
             print(
                 f"[GEMINI WARN] Model {model} quota error: {exc}", file=sys.stderr
             )
-            _MODEL_COOLDOWNS[model] = time.time() + max(config.cooldown_seconds, 30)
+            set_cooldown(model, max(config.cooldown_seconds, 30))
             errors.append(str(exc))
             continue
         except SummaryError as exc:
@@ -121,7 +89,7 @@ def summarise_with_gemini(
             errors.append(str(exc))
             continue
         else:
-            _MODEL_COOLDOWNS.pop(model, None)
+            clear_cooldown(model)
             return summary, model
 
     if errors:
@@ -172,11 +140,10 @@ def summarise_with_gemini_with_title(
     image_parts = list(_build_image_parts(image_paths, config.image_limit))
 
     errors: List[str] = []
-    now = time.time()
     last_attempted_model: str | None = None
     for model in available_models:
-        cooldown_until = _MODEL_COOLDOWNS.get(model)
-        if cooldown_until and cooldown_until > now:
+        cooldown_ts = cooldown_until(model)
+        if cooldown_ts > 0 and cooldown_ts > _now():
             continue
 
         try:
@@ -191,7 +158,7 @@ def summarise_with_gemini_with_title(
             print(
                 f"[GEMINI WARN] Model {model} quota error: {exc}", file=sys.stderr
             )
-            _MODEL_COOLDOWNS[model] = time.time() + max(config.cooldown_seconds, 30)
+            set_cooldown(model, max(config.cooldown_seconds, 30))
             errors.append(str(exc))
             continue
         except SummaryError as exc:
@@ -201,10 +168,8 @@ def summarise_with_gemini_with_title(
             errors.append(str(exc))
             continue
         else:
-            _MODEL_COOLDOWNS.pop(model, None)
-            # 첫 줄 = 제목, 나머지 = 요약문
+            clear_cooldown(model)
             raw_lines = [line.rstrip() for line in full_text.splitlines()]
-            # 앞쪽 공백 줄 제거
             while raw_lines and not raw_lines[0].strip():
                 raw_lines.pop(0)
             if not raw_lines:
@@ -213,11 +178,9 @@ def summarise_with_gemini_with_title(
                     last_model=model,
                 )
 
-            # 혹시 남아 있는 라벨 줄([제목], [요약문] 등)은 무시
             lines: List[str] = []
             for ln in raw_lines:
                 stripped = ln.strip()
-                # 완전히 라벨 형태인 줄은 건너뛴다.
                 if stripped in {"[제목]", "[요약문]"}:
                     continue
                 if stripped.lower().startswith("제목:"):
@@ -363,7 +326,6 @@ def _extract_summary_text(data: dict) -> str:
             if combined:
                 return combined
 
-        # 일부 응답은 직접 text 필드를 포함한다.
         text_fallback = candidate.get("text")
         if isinstance(text_fallback, str) and text_fallback.strip():
             return text_fallback.strip()
@@ -395,7 +357,7 @@ def _is_quota_error(message: str) -> bool:
 
 def _redact_image_data(payload: dict) -> dict:
     """이미지 base64 데이터를 제외한 디버그용 사본을 만든다."""
-    redacted = json.loads(json.dumps(payload))  # deep copy
+    redacted = json.loads(json.dumps(payload))
     contents = redacted.get("contents")
     if not isinstance(contents, list):
         return redacted
@@ -412,3 +374,9 @@ def _redact_image_data(payload: dict) -> dict:
             if isinstance(inline, dict) and "data" in inline:
                 inline["data"] = "<omitted>"
     return redacted
+
+
+def _now() -> float:
+    import time
+
+    return time.time()

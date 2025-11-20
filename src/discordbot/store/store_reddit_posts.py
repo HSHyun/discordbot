@@ -12,15 +12,14 @@ from typing import List
 import pika
 import psycopg2
 
-from crawl_reddit import DEFAULT_USER_AGENT, RedditPost, fetch_reddit_posts
-from content_fetcher import contains_video_url
-from db_utils import (
-    SourceConfig,
-    ensure_tables,
-    get_or_create_source,
-    seed_sources_from_file,
-    upsert_items,
-)
+if __package__ is None or __package__ == "":
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from discordbot.crawl.crawl_reddit import DEFAULT_USER_AGENT, RedditPost, fetch_reddit_posts
+from discordbot.services.content_fetcher import contains_video_url
+from discordbot.services.db import SourceConfig, ensure_tables, get_or_create_source, seed_sources_from_file, upsert_items
 
 SUBREDDITS = ["OpenAI", "singularity", "ClaudeAI"]
 
