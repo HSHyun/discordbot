@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
@@ -142,7 +142,7 @@ def fetch_posts_for_subreddit(subreddit: str) -> List[RedditPost]:
 
 def _filter_posts(posts: List[RedditPost]) -> tuple[List[RedditPost], int]:
     filtered = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     min_threshold = (
         now - timedelta(hours=MIN_POST_AGE_HOURS) if MIN_POST_AGE_HOURS > 0 else None
     )

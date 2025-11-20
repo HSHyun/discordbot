@@ -514,7 +514,9 @@ def fetch_reddit_posts(
 
     for child in payload.get("data", {}).get("children", []):
         node = child.get("data") or {}
-        if cutoff is not None and (node.get("created_utc") or 0) > cutoff:
+        created_ts = node.get("created_utc") or 0
+        # max_age_hours는 "이 시간보다 오래된 글은 제외"이므로 기준보다 오래된 글만 건너뛴다.
+        if cutoff is not None and created_ts < cutoff:
             continue
         created = _to_datetime(node.get("created_utc"))
         post = _build_reddit_post(
