@@ -54,7 +54,7 @@ load_env_file()
 
 DB_CONFIG = {
     "dbname": getenv_casefold("DB_NAME") or "discordbot",
-    "user": getenv_casefold("DB_USER") or "hsh",
+    "user": getenv_casefold("DB_USER") or "postgres",
     "password": getenv_casefold("DB_PASSWORD") or "",
     "host": getenv_casefold("DB_HOST") or "localhost",
     "port": env_int("DB_PORT", 5432),
