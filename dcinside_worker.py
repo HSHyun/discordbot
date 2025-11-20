@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import logging
 from pathlib import Path
 from typing import List
@@ -10,7 +11,11 @@ from typing import List
 import psycopg2
 import requests
 
-from gemini_summary import GeminiConfig, SummaryError, summarise_with_gemini
+from gemini_summary import (
+    GeminiConfig,
+    SummaryError,
+    summarise_with_gemini_with_title,
+)
 from content_fetcher import contains_video_url, download_images, fetch_post_body
 from crawl_dcinside import HEADERS
 from db_utils import (
@@ -64,7 +69,7 @@ GEMINI_TIMEOUT = env_int("GEMINI_TIMEOUT", 300)
 MAX_TEXT_LENGTH = env_int("GEMINI_MAX_TEXT", 4000)
 GEMINI_DEBUG = env_flag("GEMINI_DEBUG")
 GEMINI_COOLDOWN = env_int("GEMINI_MODEL_COOLDOWN", 600)
-
+THROTTLE_SECONDS = env_int("WORKER_THROTTLE_SECONDS", 0)
 
 def _format_comments_for_summary(comments: List[dict]) -> List[str]:
     lines: List[str] = []
@@ -190,12 +195,21 @@ def process_message(body: bytes) -> MessageHandlingResult:
 
         last_error = None
         model_used = _primary_model()
+        summary_title = None
         try:
-            summary, model_used = summarise_with_gemini(summary_input, image_paths, gemini_config)
+            summary, summary_title, model_used = summarise_with_gemini_with_title(
+                summary_input, image_paths, gemini_config
+            )
         except SummaryError as exc:
             last_error = str(exc)
             fallback_limit = gemini_config.max_text_length
-            summary = summary_input[:fallback_limit] if summary_input else None
+            if summary_input:
+                summary = summary_input[:fallback_limit]
+                first_line = summary_input.splitlines()[0].strip()
+                summary_title = first_line[:80] if first_line else "요약"
+            else:
+                summary = None
+                summary_title = None
             model_used = getattr(exc, "last_model", None) or model_used
 
         update_item_with_summary(
@@ -205,9 +219,11 @@ def process_message(body: bytes) -> MessageHandlingResult:
             summary_input,
             image_count=len(image_paths),
             model_name=model_used,
+            summary_title=summary_title,
             last_error=last_error,
         )
-
+        if THROTTLE_SECONDS > 0:
+            time.sleep(THROTTLE_SECONDS)
     return MessageHandlingResult(True, f"Processed item {item_id}")
 
 

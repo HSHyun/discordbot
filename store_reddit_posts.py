@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
@@ -85,6 +86,7 @@ DB_CONFIG = {
 
 MAX_POSTS_PER_SUBREDDIT = env_int("REDDIT_MAX_POSTS", 0)
 MIN_POST_AGE_HOURS = env_int("REDDIT_MIN_POST_AGE_HOURS", 0)
+MAX_POST_AGE_HOURS = env_int("REDDIT_MAX_POST_AGE_HOURS", 6)
 REDDIT_QUEUE = getenv_casefold("REDDIT_QUEUE") or "reddit_items"
 
 
@@ -130,21 +132,56 @@ def _publish_item_ids(queue_name: str, item_ids: List[int]) -> None:
 
 def fetch_posts_for_subreddit(subreddit: str) -> List[RedditPost]:
     limit = MAX_POSTS_PER_SUBREDDIT if MAX_POSTS_PER_SUBREDDIT > 0 else 50
+    max_age = MAX_POST_AGE_HOURS if MAX_POST_AGE_HOURS > 0 else None
     return fetch_reddit_posts(
         subreddit,
         limit=limit,
         user_agent=DEFAULT_USER_AGENT,
-        max_age_hours=MIN_POST_AGE_HOURS if MIN_POST_AGE_HOURS > 0 else None,
+        max_age_hours=max_age,
     )
 
 
-def _filter_posts(posts: List[RedditPost]) -> List[RedditPost]:
+def _filter_posts(posts: List[RedditPost]) -> tuple[List[RedditPost], int]:
     filtered = []
+    now = datetime.utcnow()
+    min_threshold = (
+        now - timedelta(hours=MIN_POST_AGE_HOURS) if MIN_POST_AGE_HOURS > 0 else None
+    )
+    max_threshold = (
+        now - timedelta(hours=MAX_POST_AGE_HOURS) if MAX_POST_AGE_HOURS > 0 else None
+    )
+
     for post in posts:
         if post.is_video or contains_video_url(post.media_urls):
             continue
+        published_at = post.created_utc
+        if min_threshold and published_at > min_threshold:
+            continue
+        if max_threshold and published_at < max_threshold:
+            continue
         filtered.append(post)
-    return filtered
+    return filtered, len(filtered)
+
+
+def _log_crawl_run(
+    conn,
+    source_name: str,
+    queued_count: int,
+    fetched_count: int,
+    filtered_count: int,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO crawl_run_log (
+                source,
+                queued_count,
+                fetched_count,
+                filtered_count
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (source_name, queued_count, fetched_count, filtered_count),
+        )
 
 
 def _normalise_reddit_comments(raw_comments: List[dict]) -> List[dict]:
@@ -257,11 +294,6 @@ def main() -> None:
         seed_sources_from_file(conn, Path("config/sources.json"))
         total_queued = 0
         for subreddit in SUBREDDITS:
-            posts = fetch_posts_for_subreddit(subreddit)
-            if not posts:
-                print(f"No posts fetched for r/{subreddit}; skipping.")
-                continue
-
             source_config = build_source_config(subreddit)
             source, created = get_or_create_source(conn, source_config)
             if created:
@@ -274,16 +306,28 @@ def main() -> None:
                 print(f"Source '{source.get('code')}' inactive; skipping r/{subreddit}.")
                 continue
 
-            filtered_posts = _filter_posts(posts)
+            posts = fetch_posts_for_subreddit(subreddit)
+            if not posts:
+                print(f"No posts fetched for r/{subreddit}; skipping.")
+                continue
+
+            filtered_posts, filtered_count = _filter_posts(posts)
             if not filtered_posts:
                 print(f"No eligible posts for r/{subreddit}; skipping.")
                 continue
 
             jobs = upsert_items(conn, source["id"], filtered_posts)
-            inserted_ids = [item_id for _post, item_id, inserted in jobs if inserted]
-            _publish_item_ids(REDDIT_QUEUE, inserted_ids)
-            total_queued += len(inserted_ids)
-            print(f"Queued {len(inserted_ids)} posts for r/{subreddit}.")
+            item_ids = [item_id for _post, item_id, _inserted in jobs]
+            _log_crawl_run(
+                conn,
+                source.get("name") or source_config.name,
+                len(item_ids),
+                len(posts),
+                filtered_count,
+            )
+            _publish_item_ids(REDDIT_QUEUE, item_ids)
+            total_queued += len(item_ids)
+            print(f"Queued {len(item_ids)} posts for r/{subreddit}.")
 
     print(f"Queued {total_queued} Reddit posts (details will be processed by workers).")
 

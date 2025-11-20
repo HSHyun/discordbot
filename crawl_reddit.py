@@ -90,12 +90,12 @@ class RedditPost:
         return self.created_utc.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     @property
-    def views(self) -> str:
-        return str(self.score)
+    def views(self) -> str | None:
+        return None
 
     @property
-    def recommends(self) -> str:
-        return str(self.score)
+    def recommends(self) -> str | None:
+        return None
 
 
 def _getenv_casefold(key: str) -> str | None:

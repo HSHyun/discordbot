@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 
 from psycopg2.extras import Json, RealDictCursor
 
@@ -92,7 +92,9 @@ def ensure_tables(conn) -> None:
                 item_id BIGINT NOT NULL REFERENCES item(id) ON DELETE CASCADE,
                 model_name TEXT NOT NULL,
                 summary_text TEXT NOT NULL,
+                summary_title TEXT NOT NULL DEFAULT '{}',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 meta JSONB NOT NULL DEFAULT '{}'::jsonb
             );
             """
@@ -107,6 +109,12 @@ def ensure_tables(conn) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_item_summary_created_at
             ON item_summary (created_at);
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_item_summary_item_model
+            ON item_summary (item_id, model_name);
             """
         )
         cur.execute(
@@ -146,6 +154,40 @@ def ensure_tables(conn) -> None:
             """
             ALTER TABLE source
             ALTER COLUMN is_active SET DEFAULT FALSE
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_run_log (
+                id BIGSERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                queued_count INT NOT NULL,
+                fetched_count INT,
+                filtered_count INT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS digest_subscription (
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT,
+                channel_id BIGINT NOT NULL UNIQUE,
+                hours_window INT NOT NULL DEFAULT 6,
+                interval_minutes INT NOT NULL DEFAULT 360,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                last_run_at TIMESTAMPTZ,
+                next_run_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_digest_subscription_next_run
+            ON digest_subscription (is_active, next_run_at);
             """
         )
     conn.commit()
@@ -451,6 +493,7 @@ def update_item_with_summary(
     raw_text: str,
     image_count: int,
     model_name: str,
+    summary_title: str | None = None,
     last_error: str | None = None,
     extra_meta: dict | None = None,
 ) -> None:
@@ -490,14 +533,21 @@ def update_item_with_summary(
         if summary:
             cur.execute(
                 """
-                INSERT INTO item_summary (item_id, model_name, summary_text, meta)
-                VALUES (%s, %s, %s, %s::jsonb)
+                INSERT INTO item_summary (item_id, model_name, summary_text, summary_title, meta)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (item_id, model_name) DO UPDATE
+                SET summary_text = EXCLUDED.summary_text,
+                    summary_title = EXCLUDED.summary_title,
+                    meta = EXCLUDED.meta,
+                    updated_at = NOW()
                 """,
                 (
                     item_id,
                     model_name,
                     summary,
+                    summary_title or "{}",
                     json.dumps(meta_payload),
                 ),
             )
     conn.commit()
+

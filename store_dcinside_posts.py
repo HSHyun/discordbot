@@ -70,11 +70,11 @@ def env_int(key: str, default: int) -> int:
 
 
 DB_CONFIG = {
-    "dbname": "discordbot",
-    "user": "hsh",
-    "password": "",
-    "host": "localhost",
-    "port": 5432,
+    "dbname": getenv_casefold("DB_NAME") or "discordbot",
+    "user": getenv_casefold("DB_USER") or "postgres",
+    "password": getenv_casefold("DB_PASSWORD") or "",
+    "host": getenv_casefold("DB_HOST") or "localhost",
+    "port": env_int("DB_PORT", 5432),
 }
 
 SOURCE_CONFIG = SourceConfig(
@@ -107,6 +107,7 @@ ALLOWED_SUBJECTS = {
 
 MAX_FETCH_POSTS = env_int("DCINSIDE_MAX_POSTS", 0)
 MIN_POST_AGE_HOURS = env_int("DCINSIDE_MIN_POST_AGE_HOURS", 0)
+MAX_POST_AGE_HOURS = env_int("DCINSIDE_MAX_POST_AGE_HOURS", 6)
 DCINSIDE_QUEUE = getenv_casefold("DCINSIDE_QUEUE") or "dcinside_items"
 
 
@@ -141,27 +142,57 @@ def _publish_item_ids(queue_name: str, item_ids: List[int]) -> None:
             connection.close()
 
 
-def _filter_posts(posts: List[Post]) -> List[Post]:
+def _filter_posts(posts: List[Post]) -> tuple[List[Post], int, int]:
+    fetched_count = len(posts)
     filtered = [post for post in posts if post.subject in ALLOWED_SUBJECTS]
+
+    # 최소 나이 필터
     if MIN_POST_AGE_HOURS > 0:
-        threshold = datetime.now(timezone.utc) - timedelta(hours=MIN_POST_AGE_HOURS)
-        aged: List[Post] = []
-        for post in filtered:
-            published_at = _parse_post_datetime(post)
-            if published_at and published_at <= threshold:
-                aged.append(post)
-        filtered = aged
+        min_threshold = datetime.now(timezone.utc) - timedelta(hours=MIN_POST_AGE_HOURS)
+        filtered = [
+            post
+            for post in filtered
+            if (published_at := _parse_post_datetime(post)) and published_at <= min_threshold
+        ]
+
+    # 최대 나이 필터 (최근 MAX_POST_AGE_HOURS 이내)
+    if MAX_POST_AGE_HOURS > 0:
+        max_threshold = datetime.now(timezone.utc) - timedelta(hours=MAX_POST_AGE_HOURS)
+        filtered = [
+            post
+            for post in filtered
+            if (published_at := _parse_post_datetime(post)) and published_at >= max_threshold
+        ]
+
     if MAX_FETCH_POSTS > 0:
         filtered = filtered[:MAX_FETCH_POSTS]
-    return filtered
+
+    return filtered, fetched_count, len(filtered)
+
+
+def _log_crawl_run(
+    conn,
+    source_name: str,
+    queued_count: int,
+    fetched_count: int,
+    filtered_count: int,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO crawl_run_log (
+                source,
+                queued_count,
+                fetched_count,
+                filtered_count
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (source_name, queued_count, fetched_count, filtered_count),
+        )
 
 
 def main() -> None:
-    posts = _filter_posts(list(fetch_posts()))
-    if not posts:
-        print("No posts matched filters; aborting.")
-        return
-
+    raw_posts = list(fetch_posts())
     with psycopg2.connect(**DB_CONFIG) as conn:
         ensure_tables(conn)
         seed_sources_from_file(conn, Path("config/sources.json"))
@@ -175,11 +206,23 @@ def main() -> None:
             print(f"Source '{source.get('code')}' is inactive; skipping crawl.")
             return
 
-        jobs = upsert_items(conn, source["id"], posts)
+        posts, fetched_count, filtered_count = _filter_posts(raw_posts)
+        if not posts:
+            print("No posts matched filters; aborting.")
+            return
 
-    inserted_ids = [item_id for _post, item_id, inserted in jobs if inserted]
-    _publish_item_ids(DCINSIDE_QUEUE, inserted_ids)
-    print(f"Queued {len(inserted_ids)} DCInside posts for processing.")
+        jobs = upsert_items(conn, source["id"], posts)
+        item_ids = [item_id for _post, item_id, _inserted in jobs]
+        _log_crawl_run(
+            conn,
+            source.get("name") or SOURCE_CONFIG.name,
+            len(item_ids),
+            fetched_count,
+            filtered_count,
+        )
+
+    _publish_item_ids(DCINSIDE_QUEUE, item_ids)
+    print(f"Queued {len(item_ids)} DCInside posts for processing.")
 
 
 if __name__ == "__main__":

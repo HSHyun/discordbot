@@ -38,7 +38,7 @@ class GeminiConfig:
             "temperature": 0.4,
             "topP": 0.95,
             "topK": 40,
-            "maxOutputTokens": 512,
+            "maxOutputTokens": 8192,  # 기본 출력 토큰을 512에서 8192로 대폭 상향
         }
     )
 
@@ -56,6 +56,7 @@ SYSTEM_PROMPT = (
     " 문어체에 가까운 한국어 문장으로 작성하며 불릿 포인트나 영어 문장은 사용하지 않습니다."
     " 답변은 3문장 이내로 유지하고 링크는 제외합니다. 이미지에서 확인한 핵심 내용이 있다면 본문"
     " 맥락에 자연스럽게 녹여 설명합니다. 고유명사는 원문 표기를 유지하세요."
+    " 정량적 표현:  '많다', '높다', '대폭' 같은 모호한 표현 대신, **'88% 증가', '300만 토큰', '1위'** 처럼 구체적인 수치나 퍼센티지를 명확히 명시하세요."
 )
 
 
@@ -122,6 +123,119 @@ def summarise_with_gemini(
         else:
             _MODEL_COOLDOWNS.pop(model, None)
             return summary, model
+
+    if errors:
+        raise SummaryError(errors[-1], last_model=last_attempted_model)
+    raise SummaryError(
+        "All Gemini models were skipped due to cooldown or configuration.",
+        last_model=last_attempted_model,
+    )
+
+
+def summarise_with_gemini_with_title(
+    text: str,
+    image_paths: Sequence[str],
+    config: GeminiConfig,
+) -> Tuple[str, str, str]:
+    if not config.api_key:
+        raise SummaryError("Missing GEMINI_API_KEY.")
+
+    text_to_use = (text or "").strip()
+    if not text_to_use:
+        if image_paths:
+            text_to_use = "(본문 텍스트 없음 — 이미지를 기반으로 요약해 주세요.)"
+        else:
+            raise SummaryError("No text or images available for summarisation.")
+
+    if len(text_to_use) > config.max_text_length:
+        text_to_use = text_to_use[: config.max_text_length] + "\n..."
+
+    user_prompt = (
+        "아래는 게시물 원문과 참고 이미지입니다.\n"
+        "1) 첫 줄에는 이 게시물을 가장 잘 요약하는 한국어 제목만 한 줄로 작성하세요.\n"
+        "2) 둘째 줄부터는 중요 내용을 2~3문장으로 자연스러운 요약문으로 작성하세요.\n"
+        "3) 제목 앞에는 '제목:', '[제목]' 같은 라벨이나 괄호를 붙이지 말고, 제목 문장만 적으세요.\n"
+        "4) '[요약문]', '요약:' 같은 라벨도 사용하지 말고, 바로 요약 문장만 적으세요.\n"
+        "5) 마크다운, 리스트, 기타 형식은 사용하지 말고, 순수한 문장만 출력하세요.\n\n"
+        "6) 비속어가 포함되어서는 안됩니다."
+        "출력 형식 (예시):\n"
+        "AI 모델 국군의 날 포스터, '굳건이' 일러스트 화제\n"
+        "국군의 날을 기념해 공개된 포스터가 온라인에서 화제가 되고 있습니다. ...\n\n"
+        "게시물 원문:\n"
+        f"{text_to_use}"
+    )
+
+    available_models = [model.strip() for model in config.model_priorities if model.strip()]
+    if not available_models:
+        raise SummaryError("No Gemini models configured.")
+
+    image_parts = list(_build_image_parts(image_paths, config.image_limit))
+
+    errors: List[str] = []
+    now = time.time()
+    last_attempted_model: str | None = None
+    for model in available_models:
+        cooldown_until = _MODEL_COOLDOWNS.get(model)
+        if cooldown_until and cooldown_until > now:
+            continue
+
+        try:
+            last_attempted_model = model
+            full_text = _invoke_gemini(
+                model=model,
+                user_prompt=user_prompt,
+                image_parts=image_parts,
+                config=config,
+            )
+        except _ModelQuotaError as exc:
+            print(
+                f"[GEMINI WARN] Model {model} quota error: {exc}", file=sys.stderr
+            )
+            _MODEL_COOLDOWNS[model] = time.time() + max(config.cooldown_seconds, 30)
+            errors.append(str(exc))
+            continue
+        except SummaryError as exc:
+            print(
+                f"[GEMINI WARN] Model {model} failed: {exc}", file=sys.stderr
+            )
+            errors.append(str(exc))
+            continue
+        else:
+            _MODEL_COOLDOWNS.pop(model, None)
+            # 첫 줄 = 제목, 나머지 = 요약문
+            raw_lines = [line.rstrip() for line in full_text.splitlines()]
+            # 앞쪽 공백 줄 제거
+            while raw_lines and not raw_lines[0].strip():
+                raw_lines.pop(0)
+            if not raw_lines:
+                raise SummaryError(
+                    "Gemini API returned empty text for title+summary.",
+                    last_model=model,
+                )
+
+            # 혹시 남아 있는 라벨 줄([제목], [요약문] 등)은 무시
+            lines: List[str] = []
+            for ln in raw_lines:
+                stripped = ln.strip()
+                # 완전히 라벨 형태인 줄은 건너뛴다.
+                if stripped in {"[제목]", "[요약문]"}:
+                    continue
+                if stripped.lower().startswith("제목:"):
+                    stripped = stripped[len("제목:") :].strip()
+                lines.append(stripped)
+
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            if not lines:
+                raise SummaryError(
+                    "Gemini API returned only label lines without content.",
+                    last_model=model,
+                )
+
+            title = lines[0].strip()
+            body_lines = [ln.strip() for ln in lines[1:] if ln.strip()]
+            summary = "\n".join(body_lines).strip() if body_lines else title
+            return summary, title, model
 
     if errors:
         raise SummaryError(errors[-1], last_model=last_attempted_model)
