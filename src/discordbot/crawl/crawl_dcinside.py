@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterator
+from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
@@ -47,8 +48,14 @@ def extract_subject(cell) -> str:
 def fetch_posts() -> Iterator[Post]:
     """추천 게시판 목록에서 게시물을 순차적으로 반환합니다."""
     req = Request(TARGET_URL, headers=HEADERS)
-    with urlopen(req) as resp:  # nosec: B310 - 신뢰된 출처에서만 호출함
-        html = resp.read()
+    try:
+        # timeout을 명시해서 DCInside 응답이 지연될 때 무한 대기를 막는다.
+        with urlopen(req, timeout=10) as resp:  # nosec: B310 - 신뢰된 출처에서만 호출함
+            html = resp.read()
+    except URLError as exc:
+        # 네트워크/타임아웃 오류 발생 시 빈 결과로 빠르게 종료
+        print(f"[crawl_dcinside] failed to fetch posts: {exc}")
+        return
 
     soup = BeautifulSoup(html, "html.parser")
     for row in soup.select("tr.ub-content.us-post"):

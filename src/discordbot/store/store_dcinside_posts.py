@@ -18,7 +18,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from discordbot.crawl.crawl_dcinside import Post, TARGET_URL, fetch_posts
-from discordbot.services.db import SourceConfig, ensure_tables, get_or_create_source, seed_sources_from_file, upsert_items
+from discordbot.services.db import SourceConfig, get_or_create_source, seed_sources_from_file, upsert_items
 
 
 def load_env_file(path: Path = Path(".env")) -> None:
@@ -193,7 +193,6 @@ def _log_crawl_run(
 def main() -> None:
     raw_posts = list(fetch_posts())
     with psycopg2.connect(**DB_CONFIG) as conn:
-        ensure_tables(conn)
         seed_sources_from_file(conn, Path("config/sources.json"))
         source, created = get_or_create_source(conn, SOURCE_CONFIG)
         if created:

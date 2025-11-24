@@ -19,7 +19,7 @@ if __package__ is None or __package__ == "":
 
 from discordbot.crawl.crawl_reddit import DEFAULT_USER_AGENT, RedditPost, fetch_reddit_posts
 from discordbot.services.content_fetcher import contains_video_url
-from discordbot.services.db import SourceConfig, ensure_tables, get_or_create_source, seed_sources_from_file, upsert_items
+from discordbot.services.db import SourceConfig, get_or_create_source, seed_sources_from_file, upsert_items
 
 SUBREDDITS = ["OpenAI", "singularity", "ClaudeAI"]
 
@@ -289,7 +289,6 @@ def compose_post_text(post: RedditPost, comment_lines: List[str] | None = None) 
 
 def main() -> None:
     with psycopg2.connect(**DB_CONFIG) as conn:
-        ensure_tables(conn)
         seed_sources_from_file(conn, Path("config/sources.json"))
         total_queued = 0
         for subreddit in SUBREDDITS:
